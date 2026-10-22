@@ -3,7 +3,7 @@ import type React from 'react';
 import { NavLink, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { Activity, AlertTriangle, BookOpen, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clock3, Download, FileText, GraduationCap, Home, Moon, Search, Settings, SlidersHorizontal, Sun, Users, WandSparkles, X, Trash2, Menu, Library, UserRound, ArrowUpRight, ArrowLeft, Undo2, Redo2 } from 'lucide-react';
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
 const links = [
   { to: '/', label: 'Dashboard', icon: Home },
   { to: '/sections', label: 'Section manager', icon: BookOpen },
@@ -19,7 +19,12 @@ type DirectoryCourse = { course_code: string; course_name: string; course_names:
 type Routine = { id: number; name: string; section_ids: number[]; preferences: Record<string,string[]>; sections?: Section[] };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, options);
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, options);
+  } catch {
+    throw new Error(`Cannot connect to the backend at ${API}. Check that the API is running and VITE_API_URL is correct.`);
+  }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const detail = body.detail;

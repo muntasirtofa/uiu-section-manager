@@ -10,16 +10,46 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import JSON, DateTime, Integer, String, create_engine, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from urllib.parse import urlsplit
 
 from .pdf_catalog import DATA_DIR
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./uiu_fall2026.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+load_dotenv(DATA_DIR.parent.parent / ".env", override=False)
+
+def database_url_from_environment() -> URL:
+    raw_url = os.getenv("DATABASE_URL", "sqlite:///./uiu_fall2026.db").strip()
+    if not raw_url:
+        raise RuntimeError("DATABASE_URL is empty. Set it to a valid SQLAlchemy connection URL.")
+    try:
+        parsed = make_url(raw_url)
+    except Exception:
+        raise RuntimeError("DATABASE_URL is not a valid SQLAlchemy connection URL.") from None
+    if parsed.drivername in {"postgres", "postgresql", "postgresql+psycopg2"}:
+        parsed = parsed.set(drivername="postgresql+psycopg")
+    if parsed.drivername.startswith("postgresql+") and parsed.drivername != "postgresql+psycopg":
+        raise RuntimeError("PostgreSQL requires the installed psycopg 3 driver (postgresql+psycopg).")
+    return parsed
+
+
+DATABASE_URL = database_url_from_environment()
+try:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={"check_same_thread": False} if DATABASE_URL.get_backend_name() == "sqlite" else {},
+    )
+except Exception:
+    raise RuntimeError("Could not configure the database engine. Check DATABASE_URL and installed database drivers.") from None
 
 
 class Base(DeclarativeBase):
@@ -51,31 +81,66 @@ class RoutineRecord(Base):
     preferences: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-Base.metadata.create_all(engine)
-
-
 def initialize_catalog() -> None:
-    """Initialize the catalog from the bundled, user-supplied Fall 2026 PDF extract."""
+    """Create missing catalog rows without replacing records or saved routines."""
     catalog = DATA_DIR / "fall_2026_sections.json"
     if not catalog.exists():
         raise RuntimeError(f"Bundled Fall 2026 catalog missing: {catalog}")
-    with Session(engine) as db:
-        payload = json.loads(catalog.read_text(encoding="utf-8"))
-        stored = {row.source_serial: row for row in db.scalars(select(SectionRecord)).all()}
-        for data in payload["sections"]:
-            record = stored.get(data["source_serial"])
-            if record is None:
-                db.add(SectionRecord(**data))
+    payload = json.loads(catalog.read_text(encoding="utf-8"))
+    records = payload.get("sections")
+    if not isinstance(records, list):
+        raise RuntimeError("Bundled Fall 2026 catalog has an invalid format: expected a sections list.")
+    if not records:
+        return
+    table = SectionRecord.__table__
+    if engine.dialect.name == "postgresql":
+        statement = postgresql_insert(table).values(records).on_conflict_do_nothing(index_elements=[table.c.source_serial])
+    elif engine.dialect.name == "sqlite":
+        statement = sqlite_insert(table).values(records).on_conflict_do_nothing(index_elements=[table.c.source_serial])
+    else:
+        with Session(engine) as db:
+            for data in records:
+                if db.scalar(select(SectionRecord.id).where(SectionRecord.source_serial == data["source_serial"])) is None:
+                    db.add(SectionRecord(**data))
+            db.commit()
+        return
+    with engine.begin() as connection:
+        for start in range(0, len(records), 100):
+            chunk = records[start:start + 100]
+            if engine.dialect.name == "postgresql":
+                chunk_statement = postgresql_insert(table).values(chunk).on_conflict_do_nothing(index_elements=[table.c.source_serial])
             else:
-                for key, value in data.items():
-                    setattr(record, key, value)
-        db.commit()
+                chunk_statement = sqlite_insert(table).values(chunk).on_conflict_do_nothing(index_elements=[table.c.source_serial])
+            connection.execute(chunk_statement)
 
 
-initialize_catalog()
+try:
+    Base.metadata.create_all(engine)
+    initialize_catalog()
+except SQLAlchemyError:
+    raise RuntimeError("Database initialization failed. Verify DATABASE_URL, database availability, and schema permissions.") from None
 
 app = FastAPI(title="UIU Section Manager API", version="2.0.0", description="Fall 2026 UIU course catalog, schedule selection, conflict checking, routine planning, and exports.")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","), allow_methods=["*"], allow_headers=["*"])
+
+
+def cors_origins_from_environment() -> list[str]:
+    configured = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+    origins = []
+    for value in configured.split(","):
+        origin = value.strip().rstrip("/")
+        if not origin:
+            continue
+        parsed = urlsplit(origin)
+        if origin == "*" or parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
+            raise RuntimeError("CORS_ORIGINS must contain comma-separated exact http(s) origins without paths or wildcards.")
+        if origin not in origins:
+            origins.append(origin)
+    if not origins:
+        raise RuntimeError("CORS_ORIGINS must include at least one exact frontend origin.")
+    return origins
+
+
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins_from_environment(), allow_methods=["*"], allow_headers=["*"])
 
 
 class Meeting(BaseModel):
@@ -123,7 +188,12 @@ def read_sections(section_ids: list[int]) -> list[dict]:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "term": "Fall 2026"}
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+    except SQLAlchemyError:
+        raise HTTPException(503, "Database connection is unavailable. Check the backend database configuration.") from None
+    return {"status": "ok", "database": "connected", "term": "Fall 2026"}
 
 
 @app.get("/api/overview")
